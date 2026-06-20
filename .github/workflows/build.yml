@@ -78,10 +78,10 @@ jobs:
           echo "Listing all built APKs:"
           find app/build/outputs/apk -type f -name '*.apk' | sort
           {
-            echo "##[set-output name=fdroid_debug;]$(find app/build/outputs/apk -type f -name '*Fdroid*debug*.apk' | head -1)"
-            echo "##[set-output name=fdroid_release;]$(find app/build/outputs/apk -type f -name '*Fdroid*release*.apk' | head -1)"
-            echo "##[set-output name=playstore_debug;]$(find app/build/outputs/apk -type f -name '*PlayStore*debug*.apk' | head -1)"
-            echo "##[set-output name=playstore_release;]$(find app/build/outputs/apk -type f -name '*PlayStore*release*.apk' | head -1)"
+            echo "fdroid_debug=$(find app/build/outputs/apk -type f -name '*Fdroid*debug*.apk' | head -1)"
+            echo "fdroid_release=$(find app/build/outputs/apk -type f -name '*Fdroid*release*.apk' | head -1)"
+            echo "playstore_debug=$(find app/build/outputs/apk -type f -name '*PlayStore*debug*.apk' | head -1)"
+            echo "playstore_release=$(find app/build/outputs/apk -type f -name '*PlayStore*release*.apk' | head -1)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload Fdroid Debug APK
