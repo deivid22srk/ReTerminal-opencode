@@ -92,6 +92,7 @@ dependencies {
     api(libs.okhttp)
     api(libs.anrwatchdog)
     api(libs.androidx.material.icons.core)
+    api(libs.androidx.material.icons.extended)
     api(libs.androidx.palette)
     api(libs.accompanist.systemuicontroller)
     // opencode integration: needed to stream-decompress the user-imported tar.gz

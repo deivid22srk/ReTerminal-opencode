@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
+import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
 import java.util.concurrent.atomic.AtomicInteger
@@ -54,8 +55,16 @@ object OpencodeServer {
     /** Last error message, if any. */
     val lastError = mutableStateOf<String?>(null)
 
-    /** Pid of the running opencode process, or -1 if not running. */
+    /** Pid of the running opencode process, or -1 if not running.
+     *  Best-effort: try Process.pid() via reflection if available (Java 9+), else -1. */
     val pid = AtomicInteger(-1)
+
+    /** Best-effort pid extraction (Process.pid() only exists on Java 9+/API 26+).
+     *  On older runtimes the reflection returns null and we just store -1. */
+    private fun Process.pidSafe(): Int = runCatching {
+        val m = Process::class.java.getMethod("pid")
+        (m.invoke(this) as Long).toInt()
+    }.getOrDefault(-1)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -150,10 +159,10 @@ object OpencodeServer {
 
                 val p = pb.start()
                 process = p
-                pid.set(p.pid().toInt())
+                pid.set(p.pidSafe())
 
                 appendLog(">>> opencode serve --hostname $hostname --port $port")
-                appendLog(">>> pid=${p.pid()}")
+                appendLog(">>> pid=${p.pidSafe()}")
 
                 // Start the reader coroutine.
                 readerJob = scope.launch {
@@ -227,7 +236,7 @@ object OpencodeServer {
     internal fun stopInternal() {
         val p = process
         if (p != null) {
-            appendLog(">>> stopping opencode process (pid=${p.pid()})")
+            appendLog(">>> stopping opencode process (pid=${p.pidSafe()})")
             runCatching { p.destroy() } // SIGTERM
             // Give it a moment, then destroyForcibly if still alive.
             scope.launch {

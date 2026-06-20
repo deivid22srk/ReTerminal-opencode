@@ -249,7 +249,7 @@ object OpencodeManager {
                             break
                         }
                         // Skip to next entry.
-                        val skipped = tis.available
+                        val skipped = tis.available()
                         if (skipped > 0) {
                             // Drain so nextEntry is positioned correctly.
                             val buf = ByteArray(64 * 1024)
