@@ -12,6 +12,12 @@
                 <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
             </intent-filter>
         </provider>
+
+        <!-- Foreground service that owns the opencode serve process lifecycle. -->
+        <service
+            android:name="com.rk.terminal.service.OpencodeService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse" />
        <!-- <service android:name="com.rk.runner.runners.web.html.HtmlRunner$DevTools"/> -->
     </application>
 </manifest>

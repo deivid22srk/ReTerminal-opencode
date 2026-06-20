@@ -94,6 +94,8 @@ dependencies {
     api(libs.androidx.material.icons.core)
     api(libs.androidx.palette)
     api(libs.accompanist.systemuicontroller)
+    // opencode integration: needed to stream-decompress the user-imported tar.gz
+    api(libs.commons.compress)
 //    api(libs.termux.shared)
 
     api(project(":core:resources"))
