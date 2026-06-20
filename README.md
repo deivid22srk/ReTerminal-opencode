@@ -26,26 +26,57 @@ flow the user never needs to touch a terminal — everything is driven by the de
 | `OpencodeService` | `core/main/src/main/java/com/rk/terminal/service/OpencodeService.kt` | Foreground service that owns the process lifecycle so it survives backgrounding. |
 | `OpencodeScreen` | `core/main/src/main/java/com/rk/terminal/ui/screens/opencode/OpencodeScreen.kt` | Material 3 UI with status card, install / start / stop / open / remove buttons, and live logs. |
 
-### Why this works on Android without root / proot
+### Why this works on Android
 
-The `opencode-linux-arm64-musl.tar.gz` release is a **single static ELF binary** built
-against musl libc. Android's Bionic libc coexists with musl-linked static binaries — they
-just need a directory where the kernel allows `exec()`. The app's private data directory
-(`/data/data/com.rk.terminal/files/local/bin/`) is exactly such a location, and is what
-ReTerminal already uses for its own `proot` binary. We re-use that infrastructure.
+The `opencode-linux-arm64-musl.tar.gz` release is a **single ELF binary** built against
+musl libc — but it is NOT fully static. It needs the musl dynamic linker
+`/lib/ld-musl-aarch64.so.1`, which Android's Bionic libc does not ship. Trying to
+`exec()` the binary directly on Android fails with `error=2, No such file or directory`.
 
-The `chmod +x` step is implemented with `File.setExecutable(true, true)`.
+The fix is to run opencode INSIDE ReTerminal's existing Alpine chroot, which already
+ships musl libc and the dynamic linker. We re-use the same proot-based chroot
+infrastructure that powers ReTerminal's terminal sessions:
+
+1. The opencode binary is installed at `alpineDir()/usr/local/bin/opencode`, so inside
+   the chroot it's reachable as `/usr/local/bin/opencode`.
+2. To start the server, `OpencodeService` invokes `init-host-opencode.sh` (a stripped-down
+   variant of ReTerminal's `init-host.sh`) which assembles the same proot bind-mount list
+   and then `exec`s into `/usr/local/bin/opencode serve --hostname 127.0.0.1 --port 4096`.
+3. The opencode process runs inside the chroot with full access to musl libc, the dynamic
+   linker, and `/proc` — but it binds `127.0.0.1:4096` on the host's network namespace, so
+   the browser can reach it directly at `http://127.0.0.1:4096`.
+
+This means **the user must open the ReTerminal terminal at least once** so the Alpine
+rootfs (~20 MB) and proot get downloaded. The OpenCode screen will detect this and show
+a warning + disable the "Iniciar servidor" button until the Alpine rootfs is ready.
 
 ### Flow when the user taps "Iniciar servidor"
 
 1. UI calls `OpencodeServer.start(context)`.
-2. `OpencodeServer` sends an `ACTION_START` Intent to `OpencodeService`.
-3. `OpencodeService` promotes itself to the foreground (so the OS won't kill it).
-4. `OpencodeService` calls `OpencodeServer.launchProcess(hostname, port)`.
-5. `OpencodeServer` runs `ProcessBuilder("/data/data/.../opencode", "serve", "--hostname", "127.0.0.1", "--port", "4096")` with `HOME=/data/data/.../opencode-home` and stream-reads stdout/stderr into a Compose-observable log buffer.
-6. A health-check coroutine polls `127.0.0.1:4096` every 500ms; once reachable, the state
-   transitions from `STARTING` to `RUNNING` and the "Abrir no navegador" button becomes
-   available.
+2. `OpencodeServer` checks that the opencode binary is installed AND that the Alpine
+   rootfs + proot are downloaded. If not, it surfaces an error in the UI.
+3. `OpencodeServer` sends an `ACTION_START` Intent to `OpencodeService`.
+4. `OpencodeService` promotes itself to the foreground (so the OS won't kill it).
+5. `OpencodeService` calls `OpencodeServer.launchProcess(hostname, port)`.
+6. `OpencodeServer` calls `OpencodeManager.launchOpencodeViaProot(["serve", "--hostname", "127.0.0.1", "--port", "4096"])`.
+7. `OpencodeManager` materializes the bundled `init-host-opencode.sh` script and runs:
+   ```
+   /system/bin/sh init-host-opencode.sh serve --hostname 127.0.0.1 --port 4096
+   ```
+   with `PREFIX=/data/data/com.rk.terminal/files`, `LINKER=/system/bin/linker64`,
+   `PROOT_LOADER=<nativeLibDir>/libproot-loader.so`, etc.
+8. The script extracts the Alpine rootfs (if not already done), then `exec`s into:
+   ```
+   linker64 proot --kill-on-exit -0 --link2symlink --sysvipc -L \
+     -b /apex -b /system -b /sdcard -b /proc -b $PREFIX ... \
+     -r $PREFIX/local/alpine -w /root \
+     /usr/local/bin/opencode serve --hostname 127.0.0.1 --port 4096
+   ```
+9. opencode boots inside the chroot, opens a listening socket on `127.0.0.1:4096`,
+   and prints `server listening on http://127.0.0.1:4096`.
+10. A health-check coroutine in `OpencodeServer` polls `127.0.0.1:4096` every 1s;
+    once reachable, the state transitions from `STARTING` to `RUNNING` and the
+    "Abrir no navegador" button becomes available.
 
 ## Building
 

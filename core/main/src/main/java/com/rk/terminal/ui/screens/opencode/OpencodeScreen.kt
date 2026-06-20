@@ -100,6 +100,13 @@ fun OpencodeScreen(
 
     var installedVersion by remember { mutableStateOf<String?>(null) }
     var isInstalled by remember { mutableStateOf(OpencodeManager.isInstalled()) }
+    var isAlpineReady by remember { mutableStateOf(OpencodeManager.isAlpineReady()) }
+
+    // Recheck Alpine readiness whenever the screen is recomposed (e.g. user returned
+    // from the terminal screen where they triggered the download).
+    LaunchedEffect(isInstalled) {
+        isAlpineReady = OpencodeManager.isAlpineReady()
+    }
 
     val serverState = OpencodeServer.state
     val serverUrl = OpencodeServer.url
@@ -246,6 +253,32 @@ fun OpencodeScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
+                // Warn the user if the Alpine rootfs isn't ready yet.
+                if (!isAlpineReady) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                        ),
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                "Alpine rootfs não encontrado",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "O opencode precisa rodar dentro do chroot Alpine do ReTerminal. " +
+                                    "Abra o terminal do ReTerminal uma vez (no drawer lateral) para " +
+                                    "que ele baixe o Alpine (~20 MB) e o proot, depois volte aqui.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                            )
+                        }
+                    }
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -254,6 +287,7 @@ fun OpencodeScreen(
                         OpencodeServer.State.STOPPED, OpencodeServer.State.FAILED -> {
                             Button(
                                 onClick = { OpencodeServer.start(context) },
+                                enabled = isAlpineReady,
                                 modifier = Modifier.weight(1f),
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = MaterialTheme.colorScheme.primary
@@ -449,7 +483,7 @@ private fun StatusCard(
                     !isInstalled -> "Importe o tar.gz do opencode para começar"
                     serverState == OpencodeServer.State.RUNNING -> serverUrl ?: "—"
                     installedVersion != null -> "Versão instalada: $installedVersion"
-                    else -> "Binário instalado em ${OpencodeManager.binaryDir.absolutePath}"
+                    else -> "Binário instalado em ${OpencodeManager.binaryFile.absolutePath}"
                 }
                 Text(
                     text = subtitle,

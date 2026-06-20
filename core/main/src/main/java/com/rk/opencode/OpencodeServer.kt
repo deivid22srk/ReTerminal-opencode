@@ -21,11 +21,18 @@ import java.io.InputStreamReader
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Runs and observes the `opencode serve` process.
+ * Runs and observes the `opencode serve` process inside the Alpine chroot via proot.
  *
- * The actual process is launched from [OpencodeService] (a foreground service), but all the
- * logic — start, stop, log capture, port probing — lives here so it can be unit tested and
- * referenced from the UI / service alike.
+ * Why proot: the opencode-linux-arm64-musl binary is dynamically linked against
+ * musl libc (`/lib/ld-musl-aarch64.so.1`). Android's Bionic libc doesn't ship
+ * that linker, so `execve("opencode")` directly fails with ENOENT (error=2).
+ * We work around this by running the binary INSIDE ReTerminal's Alpine rootfs,
+ * which already has musl libc installed, using the same proot-based chroot
+ * infrastructure that powers ReTerminal's terminal sessions.
+ *
+ * The actual process is launched from [OpencodeService] (a foreground service),
+ * but all the logic — start, stop, log capture, port probing — lives here so it
+ * can be referenced from the UI / service alike.
  */
 object OpencodeServer {
 
@@ -35,7 +42,10 @@ object OpencodeServer {
     private const val MAX_LOG_LINES = 1000
 
     /** Polling interval used to detect when the server is reachable. */
-    private const val HEALTH_POLL_MS = 500L
+    private const val HEALTH_POLL_MS = 1000L
+
+    /** Maximum number of health-check attempts before giving up. */
+    private const val HEALTH_MAX_ATTEMPTS = 60
 
     /** Server lifecycle states observed by the UI. */
     enum class State { STOPPED, STARTING, RUNNING, FAILED }
@@ -55,20 +65,15 @@ object OpencodeServer {
     /** Last error message, if any. */
     val lastError = mutableStateOf<String?>(null)
 
-    /** Pid of the running opencode process, or -1 if not running.
-     *  Best-effort: try Process.pid() via reflection if available (Java 9+), else -1. */
+    /**
+     * Pid of the running opencode process (the proot wrapper, NOT the opencode
+     * process itself inside the chroot), or -1 if not running.
+     */
     val pid = AtomicInteger(-1)
-
-    /** Best-effort pid extraction (Process.pid() only exists on Java 9+/API 26+).
-     *  On older runtimes the reflection returns null and we just store -1. */
-    private fun Process.pidSafe(): Int = runCatching {
-        val m = Process::class.java.getMethod("pid")
-        (m.invoke(this) as Long).toInt()
-    }.getOrDefault(-1)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    /** Currently running process; null when stopped. */
+    /** Currently running process (the proot wrapper); null when stopped. */
     @Volatile
     private var process: Process? = null
 
@@ -77,6 +82,15 @@ object OpencodeServer {
 
     /** Health-check job. */
     private var healthJob: Job? = null
+
+    /** Watchdog job that detects process exit. */
+    private var watcherJob: Job? = null
+
+    /** Best-effort pid extraction (Process.pid() only exists on Java 9+/API 26+). */
+    private fun Process.pidSafe(): Int = runCatching {
+        val m = Process::class.java.getMethod("pid")
+        (m.invoke(this) as Long).toInt()
+    }.getOrDefault(-1)
 
     /** Append a line to the in-memory log buffer (capped at MAX_LOG_LINES). */
     private fun appendLog(line: String) {
@@ -100,7 +114,7 @@ object OpencodeServer {
      * Starts the opencode server with the given [hostname] and [port].
      * If a process is already running, this is a no-op.
      *
-     * Should be called from the foreground service.
+     * Should be called from the foreground service or directly from the UI.
      */
     fun start(
         context: Context,
@@ -116,6 +130,13 @@ object OpencodeServer {
             state.value = State.FAILED
             return
         }
+        if (!OpencodeManager.isAlpineReady()) {
+            lastError.value = "O rootfs Alpine ainda não foi baixado. Abra o terminal " +
+                "do ReTerminal uma vez para que ele baixe o Alpine (proot + libtalloc + alpine.tar.gz), " +
+                "depois volte aqui para iniciar o servidor opencode."
+            state.value = State.FAILED
+            return
+        }
 
         // Ensure the service is up so the process is tied to a foreground lifecycle.
         val svc = Intent(context, OpencodeService::class.java).apply {
@@ -127,42 +148,25 @@ object OpencodeServer {
     }
 
     /**
-     * Internal: launches the actual `opencode serve` process.
+     * Internal: launches the actual `opencode serve` process via proot.
      * Called from the service after it has promoted itself to the foreground.
      */
     internal fun launchProcess(hostname: String, port: Int) {
         scope.launch {
             try {
-                val bin = OpencodeManager.binaryFile.absolutePath
-                val cmd = mutableListOf(
-                    bin, "serve",
-                    "--hostname", hostname,
-                    "--port", port.toString(),
-                )
-                Log.i(TAG, "Starting opencode: ${cmd.joinToString(" ")}")
-
-                val pb = ProcessBuilder(cmd).redirectErrorStream(true)
-                pb.directory(OpencodeManager.homeDir)
-                pb.environment().apply {
-                    put("HOME", OpencodeManager.homeDir.absolutePath)
-                    put("PATH", "${OpencodeManager.binaryDir.absolutePath}:/system/bin:/system/xbin")
-                    put("TMPDIR", application!!.cacheDir.absolutePath)
-                    put("XDG_CONFIG_HOME", OpencodeManager.homeDir.child(".config").absolutePath.also { File(it).mkdirs() })
-                    put("XDG_DATA_HOME", OpencodeManager.homeDir.child(".local/share").absolutePath.also { File(it).mkdirs() })
-                    put("XDG_CACHE_HOME", OpencodeManager.homeDir.child(".cache").absolutePath.also { File(it).mkdirs() })
-                }
-
                 state.value = State.STARTING
                 lastError.value = null
                 OpencodeServer.port.value = port
                 url.value = "http://$hostname:$port"
 
-                val p = pb.start()
+                appendLog(">>> Iniciando opencode serve --hostname $hostname --port $port")
+                appendLog(">>> (executando dentro do chroot Alpine via proot)")
+
+                val p = OpencodeManager.launchOpencodeViaProot(
+                    arrayOf("serve", "--hostname", hostname, "--port", port.toString())
+                )
                 process = p
                 pid.set(p.pidSafe())
-
-                appendLog(">>> opencode serve --hostname $hostname --port $port")
-                appendLog(">>> pid=${p.pidSafe()}")
 
                 // Start the reader coroutine.
                 readerJob = scope.launch {
@@ -171,7 +175,9 @@ object OpencodeServer {
                     while (line != null) {
                         appendLog(line)
                         // Detect "server listening on http://..."
-                        if (line.contains("server listening on") || line.contains("listening on")) {
+                        if (line.contains("server listening on") ||
+                            line.contains("listening on") ||
+                            line.contains("Listening on")) {
                             state.value = State.RUNNING
                         }
                         line = reader.readLine()
@@ -180,16 +186,13 @@ object OpencodeServer {
                 }
 
                 // Start a watcher coroutine that detects process exit.
-                scope.launch {
+                watcherJob = scope.launch {
                     val code = p.waitFor()
-                    appendLog("<<< process exited with code $code")
+                    appendLog("<<< processo encerrou com código $code")
                     if (state.value != State.STOPPED) {
-                        if (code != 0 && state.value != State.RUNNING) {
+                        if (code != 0) {
                             state.value = State.FAILED
-                            lastError.value = "opencode encerrou com código $code"
-                        } else if (code != 0) {
-                            state.value = State.FAILED
-                            lastError.value = "opencode encerrou com código $code"
+                            lastError.value = "opencode encerrou com código $code (veja os logs)"
                         } else {
                             state.value = State.STOPPED
                         }
@@ -201,20 +204,27 @@ object OpencodeServer {
                 // Start a health-check coroutine that polls the server URL.
                 healthJob = scope.launch {
                     var attempts = 0
-                    while (state.value == State.STARTING && attempts < 60) {
+                    while (state.value == State.STARTING && attempts < HEALTH_MAX_ATTEMPTS) {
                         delay(HEALTH_POLL_MS)
                         if (isReachable(hostname, port)) {
                             state.value = State.RUNNING
-                            appendLog(">>> health check OK at http://$hostname:$port")
+                            appendLog(">>> health check OK em http://$hostname:$port")
                             break
                         }
                         attempts++
+                    }
+                    if (state.value == State.STARTING && attempts >= HEALTH_MAX_ATTEMPTS) {
+                        appendLog(">>> health check falhou após $HEALTH_MAX_ATTEMPTS tentativas")
+                        // Don't mark as FAILED — the process might still be starting up
+                        // (proot boot + opencode init can take a while). Let the watcher
+                        // job handle the final state.
                     }
                 }
             } catch (e: IOException) {
                 Log.e(TAG, "Failed to launch opencode process", e)
                 state.value = State.FAILED
                 lastError.value = e.message ?: "IOException ao iniciar processo"
+                appendLog("!!! ${e.message}")
                 process = null
                 pid.set(-1)
             }
@@ -236,7 +246,7 @@ object OpencodeServer {
     internal fun stopInternal() {
         val p = process
         if (p != null) {
-            appendLog(">>> stopping opencode process (pid=${p.pidSafe()})")
+            appendLog(">>> parando processo opencode (pid=${p.pidSafe()})")
             runCatching { p.destroy() } // SIGTERM
             // Give it a moment, then destroyForcibly if still alive.
             scope.launch {
@@ -250,6 +260,8 @@ object OpencodeServer {
         readerJob = null
         healthJob?.cancel()
         healthJob = null
+        watcherJob?.cancel()
+        watcherJob = null
         process = null
         pid.set(-1)
         state.value = State.STOPPED
