@@ -106,6 +106,17 @@ object OpencodeManager {
     }
 
     /**
+     * True when libstdc++ and libgcc have already been installed inside the
+     * Alpine chroot. Useful for the UI to know whether the next "Iniciar servidor"
+     * will be a fast start (libs already present) or a slow start (libs need to
+     * be fetched via apk, ~30s with network).
+     */
+    fun areCppLibsInstalled(): Boolean {
+        return alpineRoot.child("usr").child("lib").child("libstdc++.so.6").exists() &&
+            alpineRoot.child("usr").child("lib").child("libgcc_s.so.1").exists()
+    }
+
+    /**
      * Returns the version string reported by `opencode --version` when run inside
      * the chroot via proot, or null on failure.
      *
@@ -232,18 +243,29 @@ object OpencodeManager {
         val app = application ?: throw IllegalStateException("Application not initialized")
         val prefix = app.filesDir.parentFile!!.absolutePath
 
-        // Materialize the init-host-opencode.sh script if not already present.
+        // ALWAYS materialize the init-host-opencode.sh script fresh, so we pick up
+        // any updates to the bundled asset. (It's tiny — ~3 KB.)
         val scriptFile = localBinDir().child("init-host-opencode")
-        if (!scriptFile.exists()) {
-            scriptFile.parentFile?.mkdirs()
-            scriptFile.createNewFile()
-            app.assets.open("init-host-opencode.sh").use { input ->
-                FileOutputStream(scriptFile).use { input.copyTo(it) }
-            }
-            scriptFile.setExecutable(true, true)
+        scriptFile.parentFile?.mkdirs()
+        scriptFile.createNewFile()
+        app.assets.open("init-host-opencode.sh").use { input ->
+            FileOutputStream(scriptFile).use { input.copyTo(it) }
+        }
+        scriptFile.setExecutable(true, true)
+
+        // PROOT_TMP_DIR — proot needs a writable directory to create its glue rootfs.
+        // The default /tmp is NOT writable from an Android unprivileged app context,
+        // so we MUST set this explicitly to a path inside the app's data dir.
+        // The ReTerminal App.kt already creates $PREFIX/tmp for this purpose.
+        val prootTmpDir = File(app.filesDir.parentFile, "tmp").apply {
+            if (!exists()) mkdirs()
+            setWritable(true, true)
+            setReadable(true, true)
+            setExecutable(true, true)
         }
 
-        // Build env for the script — same variables MkSession.kt sets.
+        // Build env for the script — same variables MkSession.kt sets, plus a few
+        // extras specifically for proot/opencode.
         val env = mutableMapOf<String, String>()
         env["PATH"] = "${System.getenv("PATH")}:/sbin:${localBinDir().absolutePath}"
         env["PREFIX"] = prefix
@@ -251,6 +273,8 @@ object OpencodeManager {
         env["LD_LIBRARY_PATH"] = app.filesDir.parentFile!!.child("local").child("lib").absolutePath
         env["LINKER"] = if (File("/system/bin/linker64").exists()) "/system/bin/linker64" else "/system/bin/linker"
         env["TMPDIR"] = app.cacheDir.absolutePath
+        // Critical: proot glue rootfs must live in app-private storage.
+        env["PROOT_TMP_DIR"] = prootTmpDir.absolutePath
         // proot loader paths — same env vars MkSession sets.
         val nativeLibDir = app.applicationInfo.nativeLibraryDir
         if (File(nativeLibDir).child("libproot-loader32.so").exists()) {
@@ -269,6 +293,7 @@ object OpencodeManager {
 
         Log.i(TAG, "Launching opencode via proot: ${cmd.joinToString(" ")}")
         Log.i(TAG, "  PREFIX=$prefix")
+        Log.i(TAG, "  PROOT_TMP_DIR=${prootTmpDir.absolutePath}")
         Log.i(TAG, "  BINARY_PATH_IN_CHROOT=$BINARY_PATH_IN_CHROOT")
 
         return ProcessBuilder(cmd)

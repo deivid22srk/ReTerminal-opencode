@@ -42,10 +42,12 @@ object OpencodeServer {
     private const val MAX_LOG_LINES = 1000
 
     /** Polling interval used to detect when the server is reachable. */
-    private const val HEALTH_POLL_MS = 1000L
+    private const val HEALTH_POLL_MS = 1500L
 
-    /** Maximum number of health-check attempts before giving up. */
-    private const val HEALTH_MAX_ATTEMPTS = 60
+    /** Maximum number of health-check attempts before giving up.
+     *  Generous: the first start installs libstdc++ via apk (~30s with network),
+     *  subsequent starts boot proot + opencode (~5-10s). */
+    private const val HEALTH_MAX_ATTEMPTS = 120
 
     /** Server lifecycle states observed by the UI. */
     enum class State { STOPPED, STARTING, RUNNING, FAILED }
@@ -161,6 +163,9 @@ object OpencodeServer {
 
                 appendLog(">>> Iniciando opencode serve --hostname $hostname --port $port")
                 appendLog(">>> (executando dentro do chroot Alpine via proot)")
+                appendLog(">>> Nota: o primeiro start pode levar ~30s para instalar")
+                appendLog(">>> libstdc++ e libgcc dentro do Alpine (via apk).")
+                appendLog(">>> Starts subsequentes são mais rápidos (~5-10s).")
 
                 val p = OpencodeManager.launchOpencodeViaProot(
                     arrayOf("serve", "--hostname", hostname, "--port", port.toString())
