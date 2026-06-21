@@ -5,4 +5,5 @@ sealed class MainActivityRoutes(val route: String) {
     data object Customization : MainActivityRoutes("customization")
     data object MainScreen : MainActivityRoutes("main")
     data object Opencode : MainActivityRoutes("opencode")
+    data object OpencodeSetup : MainActivityRoutes("opencode-setup")
 }

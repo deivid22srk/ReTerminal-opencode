@@ -22,6 +22,7 @@ import com.rk.terminal.ui.routes.MainActivityRoutes
 import com.rk.terminal.ui.screens.customization.Customization
 import com.rk.terminal.ui.screens.downloader.Downloader
 import com.rk.terminal.ui.screens.opencode.OpencodeScreen
+import com.rk.terminal.ui.screens.opencode.SetupScreen
 import com.rk.terminal.ui.screens.settings.Settings
 import com.rk.terminal.ui.screens.terminal.Rootfs
 import com.rk.terminal.ui.screens.terminal.TerminalScreen
@@ -101,6 +102,17 @@ fun MainActivityNavHost(modifier: Modifier = Modifier,navController: NavHostCont
         composable(MainActivityRoutes.Opencode.route){
             UpdateStatusBar(mainActivity,show = true)
             OpencodeScreen(navController = navController)
+        }
+        composable(MainActivityRoutes.OpencodeSetup.route){
+            UpdateStatusBar(mainActivity,show = true)
+            SetupScreen(
+                navController = navController,
+                onComplete = {
+                    navController.navigate(MainActivityRoutes.Opencode.route) {
+                        popUpTo(MainActivityRoutes.MainScreen.route)
+                    }
+                },
+            )
         }
     }
 }

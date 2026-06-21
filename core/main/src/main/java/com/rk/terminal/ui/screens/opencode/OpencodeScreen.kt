@@ -36,6 +36,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.Button
@@ -365,7 +366,9 @@ fun OpencodeScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             } else {
-                // Warn the user if the Alpine rootfs isn't ready yet.
+                // Warn the user if the Alpine rootfs isn't ready yet — and offer to
+                // run the dedicated setup wizard (which downloads Alpine + installs
+                // libstdc++ + installs opencode in a single guided flow).
                 if (!isAlpineReady) {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
@@ -375,19 +378,36 @@ fun OpencodeScreen(
                     ) {
                         Column(modifier = Modifier.padding(16.dp)) {
                             Text(
-                                "Alpine rootfs não encontrado",
+                                "Setup inicial necessário",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.SemiBold,
                                 color = MaterialTheme.colorScheme.onTertiaryContainer,
                             )
                             Spacer(Modifier.height(4.dp))
                             Text(
-                                "O opencode precisa rodar dentro do chroot Alpine do ReTerminal. " +
-                                    "Abra o terminal do ReTerminal uma vez (no drawer lateral) para " +
-                                    "que ele baixe o Alpine (~20 MB) e o proot, depois volte aqui.",
+                                "O opencode precisa do Alpine rootfs + proot + libstdc++ antes de " +
+                                    "iniciar. Toque abaixo para executar o setup guiado com " +
+                                    "mini-terminal mostrando o progresso.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onTertiaryContainer,
                             )
+                            Spacer(Modifier.height(8.dp))
+                            Button(
+                                onClick = {
+                                    navController?.navigate(
+                                        com.rk.terminal.ui.routes.MainActivityRoutes.OpencodeSetup.route
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.tertiary,
+                                    contentColor = MaterialTheme.colorScheme.onTertiary,
+                                ),
+                            ) {
+                                Icon(Icons.Filled.Settings, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Executar setup inicial")
+                            }
                         }
                     }
                 }
