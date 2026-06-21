@@ -174,36 +174,60 @@ object OpencodeServer {
                 pid.set(p.pidSafe())
 
                 // Start the reader coroutine.
+                // IMPORTANT: when stop() calls p.destroy(), the process's stdout
+                // is closed, which causes reader.readLine() to throw
+                // InterruptedIOException. We MUST catch this — otherwise the
+                // exception propagates up through the coroutine and crashes the
+                // app with "FATAL EXCEPTION: DefaultDispatcher-worker-1".
                 readerJob = scope.launch {
                     val reader = BufferedReader(InputStreamReader(p.inputStream))
-                    var line = reader.readLine()
-                    while (line != null) {
-                        appendLog(line)
-                        // Detect "server listening on http://..."
-                        if (line.contains("server listening on") ||
-                            line.contains("listening on") ||
-                            line.contains("Listening on")) {
-                            state.value = State.RUNNING
+                    try {
+                        var line = reader.readLine()
+                        while (line != null) {
+                            appendLog(line)
+                            // Detect "server listening on http://..."
+                            if (line.contains("server listening on") ||
+                                line.contains("listening on") ||
+                                line.contains("Listening on")) {
+                                state.value = State.RUNNING
+                            }
+                            line = reader.readLine()
                         }
-                        line = reader.readLine()
+                    } catch (e: java.io.InterruptedIOException) {
+                        // Expected when stop() closes the stream from another thread.
+                        Log.d(TAG, "reader interrupted by stop() — expected")
+                    } catch (e: java.io.IOException) {
+                        // Expected when the process is destroyed (stream closed).
+                        Log.d(TAG, "reader IOException (stream closed): ${e.message}")
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        // Coroutine was cancelled — rethrow to propagate cancellation.
+                        throw e
+                    } finally {
+                        try { reader.close() } catch (_: Exception) {}
                     }
-                    try { reader.close() } catch (_: Exception) {}
                 }
 
                 // Start a watcher coroutine that detects process exit.
                 watcherJob = scope.launch {
-                    val code = p.waitFor()
-                    appendLog("<<< processo encerrou com código $code")
-                    if (state.value != State.STOPPED) {
-                        if (code != 0) {
-                            state.value = State.FAILED
-                            lastError.value = "opencode encerrou com código $code (veja os logs)"
-                        } else {
-                            state.value = State.STOPPED
+                    try {
+                        val code = p.waitFor()
+                        appendLog("<<< processo encerrou com código $code")
+                        if (state.value != State.STOPPED) {
+                            if (code != 0) {
+                                state.value = State.FAILED
+                                lastError.value = "opencode encerrou com código $code (veja os logs)"
+                            } else {
+                                state.value = State.STOPPED
+                            }
                         }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.d(TAG, "watcher exception: ${e.message}")
+                    } finally {
+                        process = null
+                        pid.set(-1)
                     }
-                    process = null
-                    pid.set(-1)
                 }
 
                 // Start a health-check coroutine that polls the server URL.
@@ -250,9 +274,18 @@ object OpencodeServer {
 
     internal fun stopInternal() {
         val p = process
+        // Cancel health-check and watcher FIRST so they don't race with the
+        // state transition below. The reader is left running — it will exit
+        // naturally when p.destroy() closes the process's stdout (its
+        // readLine() throws InterruptedIOException which we catch).
+        healthJob?.cancel()
+        healthJob = null
+        watcherJob?.cancel()
+        watcherJob = null
+
         if (p != null) {
             appendLog(">>> parando processo opencode (pid=${p.pidSafe()})")
-            runCatching { p.destroy() } // SIGTERM
+            runCatching { p.destroy() } // SIGTERM — closes stdout, reader exits
             // Give it a moment, then destroyForcibly if still alive.
             scope.launch {
                 delay(2000)
@@ -261,12 +294,14 @@ object OpencodeServer {
                 }
             }
         }
+
+        // Cancel the reader AFTER destroy() so it has a chance to observe the
+        // stream closing and exit cleanly. (If we cancel before destroy, the
+        // coroutine's cancellation won't take effect while it's blocked in
+        // readLine() — we'd leak the coroutine.)
         readerJob?.cancel()
         readerJob = null
-        healthJob?.cancel()
-        healthJob = null
-        watcherJob?.cancel()
-        watcherJob = null
+
         process = null
         pid.set(-1)
         state.value = State.STOPPED

@@ -79,6 +79,7 @@ dependencies {
     api(libs.activity)
     api(libs.lifecycle.viewmodel.ktx)
     api(libs.lifecycle.runtime.ktx)
+    api(libs.lifecycle.runtime.compose)
     api(libs.activity.compose)
     api(platform(libs.compose.bom))
     api(libs.ui)

@@ -1,9 +1,15 @@
 package com.rk.terminal.ui.screens.opencode
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -29,6 +35,7 @@ import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.Button
@@ -101,6 +108,62 @@ fun OpencodeScreen(
     var installedVersion by remember { mutableStateOf<String?>(null) }
     var isInstalled by remember { mutableStateOf(OpencodeManager.isInstalled()) }
     var isAlpineReady by remember { mutableStateOf(OpencodeManager.isAlpineReady()) }
+
+    // ---- Storage permission gate ----
+    // On Android 11+ (API 30+) we need MANAGE_EXTERNAL_STORAGE (All files access),
+    // which can only be granted via the system Settings page.
+    // On older Android we request READ/WRITE_EXTERNAL_STORAGE via the dialog.
+    // Without storage permission, importing the tar.gz from /sdcard/Download fails
+    // silently on some devices (SAF picker doesn't show the file, or ContentResolver
+    // returns null when opening the URI).
+    var hasStoragePermission by remember { mutableStateOf(checkStoragePermission(context)) }
+
+    // Re-check permission whenever the screen is resumed (e.g. user returned from
+    // the system Settings page where they granted MANAGE_EXTERNAL_STORAGE).
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                hasStoragePermission = checkStoragePermission(context)
+                isAlpineReady = OpencodeManager.isAlpineReady()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Runtime permission launcher for READ/WRITE_EXTERNAL_STORAGE (Android < 11).
+    val requestStoragePermission = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        hasStoragePermission = results.values.all { it }
+    }
+
+    fun requestStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ — MANAGE_EXTERNAL_STORAGE can't be requested via dialog,
+            // must send the user to the system Settings page.
+            runCatching {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:${context.packageName}")
+                )
+                context.startActivity(intent)
+            }.onFailure {
+                // Fallback: open the generic "all files" settings page.
+                val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                context.startActivity(intent)
+            }
+        } else {
+            // Android 10 and below — request via dialog.
+            requestStoragePermission.launch(
+                arrayOf(
+                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                )
+            )
+        }
+    }
 
     // Recheck Alpine readiness whenever the screen is recomposed (e.g. user returned
     // from the terminal screen where they triggered the download).
@@ -225,6 +288,55 @@ fun OpencodeScreen(
 
             // ---- Action buttons ----
             if (!isInstalled) {
+                // ---- Storage permission gate ----
+                // Force the user to grant storage permission before allowing import.
+                // Without it, on some devices the SAF file picker can't see files
+                // in /sdcard/Download, or the ContentResolver returns null.
+                if (!hasStoragePermission) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer
+                        ),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                "Permissão de armazenamento necessária",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                            Text(
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                    "Para importar o tar.gz do opencode, conceda acesso a todos os " +
+                                        "arquivos. Você será redirecionado para as Configurações do " +
+                                        "Android — ative a permissão e volte para este app."
+                                } else {
+                                    "Para importar o tar.gz do opencode, conceda permissão de " +
+                                        "leitura/escrita no armazenamento."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                            Button(
+                                onClick = { requestStoragePermission() },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.error,
+                                    contentColor = MaterialTheme.colorScheme.onError,
+                                ),
+                            ) {
+                                Icon(Icons.Filled.Security, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Conceder permissão de armazenamento")
+                            }
+                        }
+                    }
+                }
+
                 Button(
                     onClick = {
                         pickTarGz.launch(
@@ -236,7 +348,7 @@ fun OpencodeScreen(
                             )
                         )
                     },
-                    enabled = !isInstalling.value,
+                    enabled = !isInstalling.value && hasStoragePermission,
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.primary
@@ -500,5 +612,29 @@ private fun StatusCard(
                 }
             }
         }
+    }
+}
+
+/**
+ * Checks whether the app has storage permission.
+ *
+ * - Android 11+ (API 30+): MANAGE_EXTERNAL_STORAGE (All files access).
+ * - Android 10 and below: READ_EXTERNAL_STORAGE + WRITE_EXTERNAL_STORAGE.
+ *
+ * Without this permission, on some devices the SAF file picker can't see files
+ * in /sdcard/Download, or ContentResolver.openInputStream() returns null. The
+ * user explicitly requested that the import button be disabled until storage
+ * permission is granted.
+ */
+private fun checkStoragePermission(context: android.content.Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Environment.isExternalStorageManager()
+    } else {
+        ContextCompat.checkSelfPermission(
+            context, Manifest.permission.READ_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED &&
+        ContextCompat.checkSelfPermission(
+            context, Manifest.permission.WRITE_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED
     }
 }
