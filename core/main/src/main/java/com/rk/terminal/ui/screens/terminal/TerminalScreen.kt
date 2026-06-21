@@ -309,7 +309,15 @@ fun TerminalScreen(
                             Row {
                                 val keyboardController = LocalSoftwareKeyboardController.current
                                 IconButton(onClick = {
-                                    navController.navigate(MainActivityRoutes.Opencode.route)
+                                    // If the OpenCode setup isn't complete yet, go directly to
+                                    // the SetupScreen — NOT the OpencodeScreen (which would just
+                                    // show a "setup needed" message and require another tap).
+                                    val route = if (com.rk.opencode.SetupManager.isSetupComplete()) {
+                                        MainActivityRoutes.Opencode.route
+                                    } else {
+                                        MainActivityRoutes.OpencodeSetup.route
+                                    }
+                                    navController.navigate(route)
                                     keyboardController?.hide()
                                 }) {
                                     Icon(

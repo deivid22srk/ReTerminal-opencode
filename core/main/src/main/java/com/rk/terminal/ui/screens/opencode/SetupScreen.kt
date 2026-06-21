@@ -1,6 +1,5 @@
 package com.rk.terminal.ui.screens.opencode
 
-import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,7 +24,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CloudDownload
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.UploadFile
@@ -71,20 +69,23 @@ import kotlinx.coroutines.withContext
 /**
  * First-run Setup screen for the OpenCode integration.
  *
- * Replaces the old flow where the user had to open ReTerminal's terminal screen
- * first to trigger the Alpine download + apk setup. Now everything is driven
- * from a single dedicated screen with a mini-terminal showing real-time progress.
+ * **Step ordering (as requested by the user):**
  *
- * Steps:
- *   1) Download Alpine rootfs + proot + libtalloc (~20 MB).
- *   2) Extract Alpine and install libstdc++ + libgcc inside the chroot via apk.
- *   3) Install opencode: either download from GitHub releases or import manually.
- *   4) Done — user proceeds to the OpenCode server screen.
+ *   Step 1 — Install opencode:
+ *            • Show GitHub releases (only the compatible asset for the device ABI)
+ *            • User taps one to download, OR imports a tar.gz manually
+ *            • Progress streams to the mini-terminal
  *
- * Each step shows:
- *   - A status line (current step + progress %)
- *   - A linear progress bar
- *   - A "mini-terminal" panel with streaming log output
+ *   Step 2 — Download Alpine rootfs + proot + libtalloc (~20 MB).
+ *            Automatic after step 1.
+ *
+ *   Step 3 — Extract Alpine and install libstdc++ + libgcc inside the chroot
+ *            via `apk add`. Automatic after step 2.
+ *
+ *   Step 4 — Done. User proceeds to the OpenCode server screen.
+ *
+ * The user NEVER has to open the ReTerminal terminal screen — everything is
+ * driven from this dedicated setup screen.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -103,21 +104,19 @@ fun SetupScreen(
     val statusMessage = SetupManager.statusMessage
     val logLines = SetupManager.logLines
     val lastError = SetupManager.lastError
-    val isComplete = SetupManager.isComplete
 
     // Local UI state.
     var releases by remember { mutableStateOf<List<OpencodeRelease>>(emptyList()) }
     var releasesLoading by remember { mutableStateOf(false) }
     var releasesError by remember { mutableStateOf<String?>(null) }
     var selectedRelease by remember { mutableStateOf<OpencodeRelease?>(null) }
-    var showReleases by remember { mutableStateOf(false) }
 
-    // Compute which steps are already done (so the UI can pre-check them).
-    var step1Done by remember { mutableStateOf(SetupManager.isAlpineDownloaded()) }
-    var step2Done by remember { mutableStateOf(SetupManager.areCppLibsInstalled()) }
-    var step3Done by remember { mutableStateOf(SetupManager.isOpencodeInstalled()) }
+    // Track which steps are done so the UI can pre-check them.
+    var step1Done by remember { mutableStateOf(SetupManager.isOpencodeInstalled()) }
+    var step2Done by remember { mutableStateOf(SetupManager.isAlpineDownloaded()) }
+    var step3Done by remember { mutableStateOf(SetupManager.areCppLibsInstalled()) }
 
-    // Auto-scroll the mini-terminal to the bottom.
+    // Auto-scroll the mini-terminal.
     val logListState = rememberLazyListState()
     LaunchedEffect(logLines.size) {
         if (logLines.isNotEmpty()) {
@@ -125,9 +124,10 @@ fun SetupScreen(
         }
     }
 
-    // When the user opens the "Download from GitHub" panel, fetch releases.
-    LaunchedEffect(showReleases) {
-        if (showReleases && releases.isEmpty() && !releasesLoading) {
+    // Pre-fetch GitHub releases on first show — this is step 1, so it should
+    // be visible immediately when the user enters the setup screen.
+    LaunchedEffect(Unit) {
+        if (releases.isEmpty() && !releasesLoading) {
             releasesLoading = true
             releasesError = null
             try {
@@ -143,45 +143,53 @@ fun SetupScreen(
         }
     }
 
-    // SAF launcher for manual import.
+    // SAF launcher for manual import (step 1 alternative).
     val pickTarGz = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri != null) {
             scope.launch {
-                val ok = SetupManager.runStep3ImportOpencode(context, uri)
+                val ok = SetupManager.runStep1ImportOpencode(context, uri)
                 if (ok) {
-                    step3Done = true
-                    SetupManager.markComplete()
-                    snackbarHostState.showSnackbar("opencode instalado!")
-                    onComplete()
+                    step1Done = true
+                    // Auto-advance to steps 2 + 3.
+                    autoAdvanceToSteps23(scope, snackbarHostState, lastError) {
+                        step2Done = SetupManager.isAlpineDownloaded()
+                        step3Done = SetupManager.areCppLibsInstalled()
+                        if (SetupManager.isSetupComplete()) {
+                            SetupManager.markComplete()
+                            onComplete()
+                        }
+                    }
                 } else {
-                    snackbarHostState.showSnackbar("Falha: ${lastError.value ?: "erro"}")
+                    snackbarHostState.showSnackbar("Falha: ${lastError.value ?: ""}")
                 }
             }
         }
     }
 
-    // Helper: run steps 1+2 in sequence (so the user only taps one button for both).
-    fun runSteps1And2() {
+    // Helper: run steps 2 + 3 in sequence (called automatically after step 1).
+    fun runSteps2And3() {
         scope.launch {
-            step1Done = SetupManager.isAlpineDownloaded()
-            step2Done = SetupManager.areCppLibsInstalled()
-            if (!step1Done) {
-                val ok = SetupManager.runStep1DownloadAlpine()
-                if (!ok) {
-                    snackbarHostState.showSnackbar("Etapa 1 falhou: ${lastError.value ?: ""}")
-                    return@launch
-                }
-                step1Done = true
-            }
             if (!step2Done) {
-                val ok = SetupManager.runStep2InstallCppLibs()
+                val ok = SetupManager.runStep2DownloadAlpine()
                 if (!ok) {
                     snackbarHostState.showSnackbar("Etapa 2 falhou: ${lastError.value ?: ""}")
                     return@launch
                 }
                 step2Done = true
+            }
+            if (!step3Done) {
+                val ok = SetupManager.runStep3InstallCppLibs()
+                if (!ok) {
+                    snackbarHostState.showSnackbar("Etapa 3 falhou: ${lastError.value ?: ""}")
+                    return@launch
+                }
+                step3Done = true
+            }
+            if (SetupManager.isSetupComplete()) {
+                SetupManager.markComplete()
+                onComplete()
             }
         }
     }
@@ -209,28 +217,32 @@ fun SetupScreen(
             // ---- Step cards (1, 2, 3) ----
             StepCard(
                 number = 1,
-                title = "Baixar Alpine rootfs + proot",
-                subtitle = "Baixa ~20 MB de arquivos necessários para o chroot Alpine",
+                title = "Instalar opencode",
+                subtitle = "Escolha um release do GitHub OU importe um tar.gz manualmente",
                 isDone = step1Done,
-                isActive = currentStep.value == Step.DOWNLOAD_ALPINE,
+                isActive = currentStep.value == Step.INSTALL_OPENCODE,
             )
             StepCard(
                 number = 2,
-                title = "Instalar libstdc++ no Alpine",
-                subtitle = "Executa apk add libstdc++ libgcc dentro do chroot (requer internet)",
+                title = "Baixar Alpine rootfs + proot",
+                subtitle = "Baixa ~20 MB de arquivos necessários para o chroot Alpine",
                 isDone = step2Done,
-                isActive = currentStep.value == Step.INSTALL_CPPLIBS,
+                isActive = currentStep.value == Step.DOWNLOAD_ALPINE,
             )
             StepCard(
                 number = 3,
-                title = "Instalar opencode",
-                subtitle = "Baixe da lista de releases do GitHub OU importe um tar.gz manualmente",
+                title = "Instalar libstdc++ no Alpine",
+                subtitle = "Executa apk add libstdc++ libgcc dentro do chroot (requer internet)",
                 isDone = step3Done,
-                isActive = currentStep.value == Step.INSTALL_OPENCODE,
+                isActive = currentStep.value == Step.INSTALL_CPPLIBS,
             )
 
             // ---- Active step progress bar ----
-            AnimatedVisibility(visible = currentStep.value != Step.IDLE && currentStep.value != Step.DONE && currentStep.value != Step.FAILED) {
+            AnimatedVisibility(
+                visible = currentStep.value != Step.IDLE &&
+                    currentStep.value != Step.DONE &&
+                    currentStep.value != Step.FAILED
+            ) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(
@@ -245,6 +257,13 @@ fun SetupScreen(
                             "${currentStep.value.displayName}… ${(progress.value * 100).toInt()}%",
                             style = MaterialTheme.typography.bodyMedium,
                         )
+                        if (statusMessage.value.isNotBlank()) {
+                            Text(
+                                statusMessage.value,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                         LinearProgressIndicator(
                             progress = { progress.value.coerceIn(0f, 1f) },
                             modifier = Modifier.fillMaxWidth(),
@@ -253,10 +272,97 @@ fun SetupScreen(
                 }
             }
 
-            // ---- Action buttons ----
-            if (!step1Done || !step2Done) {
+            // ---- Step 1 content: GitHub releases OR import ----
+            // This is ALWAYS shown if step 1 isn't done — the user must pick
+            // a release or import before they can proceed.
+            if (!step1Done) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    ),
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            "Releases do GitHub (compatíveis com seu dispositivo)",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Spacer(Modifier.height(8.dp))
+
+                        if (releasesLoading) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Carregando releases...", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                        if (releasesError != null) {
+                            Text(
+                                releasesError!!,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+
+                        // Show the 10 most recent compatible releases.
+                        releases.take(10).forEach { rel ->
+                            ReleaseRow(
+                                release = rel,
+                                isDownloading = currentStep.value == Step.INSTALL_OPENCODE,
+                                onDownload = {
+                                    selectedRelease = rel
+                                    scope.launch {
+                                        val ok = SetupManager.runStep1DownloadOpencode(rel)
+                                        if (ok) {
+                                            step1Done = true
+                                            // Auto-advance to steps 2 + 3.
+                                            runSteps2And3()
+                                        } else {
+                                            snackbarHostState.showSnackbar("Falha: ${lastError.value ?: ""}")
+                                        }
+                                    }
+                                },
+                            )
+                            Spacer(Modifier.height(4.dp))
+                        }
+
+                        if (releases.isNotEmpty()) {
+                            Text(
+                                "Mostrando os ${releases.size.coerceAtMost(10)} releases mais recentes. " +
+                                    "Para versões antigas, use a importação manual abaixo.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                pickTarGz.launch(
+                                    arrayOf(
+                                        "application/gzip",
+                                        "application/x-gzip",
+                                        "application/x-tar",
+                                        "application/octet-stream",
+                                    )
+                                )
+                            },
+                            enabled = currentStep.value != Step.INSTALL_OPENCODE,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Icon(Icons.Filled.UploadFile, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Ou importar um .tar.gz manualmente")
+                        }
+                    }
+                }
+            }
+
+            // ---- Manual trigger for steps 2+3 (if step 1 done but 2/3 not) ----
+            if (step1Done && (!step2Done || !step3Done)) {
                 Button(
-                    onClick = { runSteps1And2() },
+                    onClick = { runSteps2And3() },
                     enabled = currentStep.value == Step.IDLE ||
                         currentStep.value == Step.DONE ||
                         currentStep.value == Step.FAILED,
@@ -264,103 +370,11 @@ fun SetupScreen(
                 ) {
                     Icon(Icons.Filled.CloudDownload, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text(if (step1Done && step2Done) "Reexecutar etapas 1-2" else "Baixar e configurar Alpine")
-                }
-            }
-
-            // ---- Step 3 actions: download from GitHub OR import ----
-            if (step1Done && step2Done && !step3Done) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Button(
-                        onClick = { showReleases = !showReleases },
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Icon(Icons.Filled.CloudDownload, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Baixar do GitHub")
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            pickTarGz.launch(
-                                arrayOf(
-                                    "application/gzip",
-                                    "application/x-gzip",
-                                    "application/x-tar",
-                                    "application/octet-stream",
-                                )
-                            )
-                        },
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Icon(Icons.Filled.UploadFile, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Importar .tar.gz")
-                    }
-                }
-
-                AnimatedVisibility(visible = showReleases) {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant
-                        ),
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Text(
-                                "Releases compatíveis",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                            Spacer(Modifier.height(8.dp))
-
-                            if (releasesLoading) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                                    Spacer(Modifier.width(8.dp))
-                                    Text("Carregando...", style = MaterialTheme.typography.bodySmall)
-                                }
-                            }
-                            if (releasesError != null) {
-                                Text(
-                                    releasesError!!,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.error,
-                                )
-                            }
-                            releases.take(10).forEach { rel ->
-                                ReleaseRow(
-                                    release = rel,
-                                    isDownloading = currentStep.value == Step.INSTALL_OPENCODE,
-                                    onDownload = {
-                                        selectedRelease = rel
-                                        scope.launch {
-                                            val ok = SetupManager.runStep3DownloadOpencode(rel)
-                                            if (ok) {
-                                                step3Done = true
-                                                SetupManager.markComplete()
-                                                snackbarHostState.showSnackbar("opencode ${rel.tagName} instalado!")
-                                                onComplete()
-                                            } else {
-                                                snackbarHostState.showSnackbar("Falha: ${lastError.value ?: ""}")
-                                            }
-                                        }
-                                    },
-                                )
-                                Spacer(Modifier.height(4.dp))
-                            }
-                            if (releases.isNotEmpty()) {
-                                Text(
-                                    "Mostrando os ${releases.size.coerceAtMost(10)} releases mais recentes. " +
-                                        "Para versões antigas, use \"Importar .tar.gz\".",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                    }
+                    Text(
+                        if (step2Done && !step3Done) "Executar etapa 3 (libstdc++)"
+                        else if (!step2Done && step3Done) "Executar etapa 2 (Alpine)"
+                        else "Baixar e configurar Alpine + libstdc++"
+                    )
                 }
             }
 
@@ -451,6 +465,38 @@ fun SetupScreen(
     }
 }
 
+/**
+ * Helper: auto-advance to steps 2 and 3 after step 1 completes.
+ * Runs in the given [scope], shows errors via [snackbarHostState].
+ */
+private fun autoAdvanceToSteps23(
+    scope: kotlinx.coroutines.CoroutineScope,
+    snackbarHostState: SnackbarHostState,
+    lastError: androidx.compose.runtime.MutableState<String?>,
+    onAllDone: () -> Unit,
+) {
+    scope.launch {
+        if (!SetupManager.isAlpineDownloaded()) {
+            val ok = SetupManager.runStep2DownloadAlpine()
+            if (!ok) {
+                snackbarHostState.showSnackbar("Etapa 2 falhou: ${lastError.value ?: ""}")
+                return@launch
+            }
+        }
+        if (!SetupManager.areCppLibsInstalled()) {
+            val ok = SetupManager.runStep3InstallCppLibs()
+            if (!ok) {
+                snackbarHostState.showSnackbar("Etapa 3 falhou: ${lastError.value ?: ""}")
+                return@launch
+            }
+        }
+        if (SetupManager.isSetupComplete()) {
+            SetupManager.markComplete()
+            onAllDone()
+        }
+    }
+}
+
 /** A single step card with number, title, subtitle, and a status indicator. */
 @Composable
 private fun StepCard(
@@ -477,7 +523,6 @@ private fun StepCard(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            // Number circle / status icon
             Box(
                 modifier = Modifier
                     .size(32.dp)
@@ -526,7 +571,7 @@ private fun StepCard(
     }
 }
 
-/** A single release row inside the "Download from GitHub" panel. */
+/** A single release row inside the GitHub releases panel. */
 @Composable
 private fun ReleaseRow(
     release: OpencodeRelease,

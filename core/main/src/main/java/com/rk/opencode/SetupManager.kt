@@ -10,14 +10,10 @@ import com.rk.libcommons.alpineDir
 import com.rk.libcommons.application
 import com.rk.libcommons.child
 import com.rk.libcommons.localBinDir
-import com.rk.libcommons.localDir
 import com.rk.libcommons.localLibDir
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -33,16 +29,20 @@ import java.io.IOException
 import java.io.InputStreamReader
 
 /**
- * Manages the end-to-end first-run setup of the OpenCode integration:
+ * Manages the end-to-end first-run setup of the OpenCode integration.
  *
- *   Step 1 — Download Alpine rootfs + proot + libtalloc (~20 MB)
- *            (same files ReTerminal downloads, but exposed here with progress)
+ * **Step ordering (as requested by the user):**
  *
- *   Step 2 — Extract Alpine and install libstdc++ + libgcc inside the chroot
+ *   Step 1 — Install opencode: download from GitHub releases OR import via SAF.
+ *            The user picks which release to install (or imports a tar.gz
+ *            manually). This is the FIRST step because it's what the user
+ *            actually came here to do.
+ *
+ *   Step 2 — Download Alpine rootfs + proot + libtalloc (~20 MB).
+ *            Same files ReTerminal downloads, but exposed here with progress.
+ *
+ *   Step 3 — Extract Alpine and install libstdc++ + libgcc inside the chroot
  *            via `apk add`, streaming apk's output to the UI.
- *
- *   Step 3 — Install opencode: either download opencode-linux-arm64-musl.tar.gz
- *            from the GitHub releases API, or accept a manual import via SAF.
  *
  *   Step 4 — Done.
  *
@@ -51,11 +51,17 @@ import java.io.InputStreamReader
  *
  * This replaces the old flow where the user had to open ReTerminal's terminal
  * screen first to trigger the Alpine download + apk setup. Now everything is
- * driven from the dedicated OpenCode setup screen.
+ * driven from the dedicated OpenCode setup screen — the user NEVER has to
+ * open the terminal.
  */
 object SetupManager {
 
     private const val TAG = "SetupManager"
+
+    /** Minimum acceptable size for the opencode binary (50 MB).
+     *  The real binary is ~160 MB; anything smaller means extraction failed
+     *  or the user picked the wrong file. */
+    private const val MIN_BINARY_SIZE_BYTES = 50L * 1024 * 1024
 
     /** ABI-specific Alpine/proot/talloc download URLs (same as ReTerminal's Downloader.kt). */
     private data class AbiUrls(val talloc: String, val proot: String, val alpine: String)
@@ -78,12 +84,16 @@ object SetupManager {
         ),
     )
 
-    /** One of the setup steps. */
+    /** One of the setup steps.
+     *
+     *  NOTE: The order is OPENCODE first, then ALPINE, then CPPLIBS — this is
+     *  what the user explicitly requested: "na etapa 1 vai aparecer os releases
+     *  do github no nosso próprio app". */
     enum class Step(val displayName: String) {
         IDLE("Aguardando início"),
-        DOWNLOAD_ALPINE("Etapa 1/3 — Baixando Alpine + proot"),
-        INSTALL_CPPLIBS("Etapa 2/3 — Instalando libstdc++ no chroot"),
-        INSTALL_OPENCODE("Etapa 3/3 — Instalando opencode"),
+        INSTALL_OPENCODE("Etapa 1/3 — Instalando opencode"),
+        DOWNLOAD_ALPINE("Etapa 2/3 — Baixando Alpine + proot"),
+        INSTALL_CPPLIBS("Etapa 3/3 — Instalando libstdc++ no chroot"),
         DONE("Setup concluído"),
         FAILED("Falha no setup"),
     }
@@ -123,10 +133,13 @@ object SetupManager {
         logLines.clear()
     }
 
-    /**
-     * Returns true if step 1 (Alpine rootfs + proot + libtalloc) is already done.
-     * Useful for the UI to skip ahead on subsequent runs.
-     */
+    /** Returns true if step 1 (opencode binary installed) is already done. */
+    fun isOpencodeInstalled(): Boolean {
+        val f = OpencodeManager.binaryFile
+        return f.exists() && f.canExecute() && f.length() >= MIN_BINARY_SIZE_BYTES
+    }
+
+    /** Returns true if step 2 (Alpine rootfs + proot + libtalloc) is already done. */
     fun isAlpineDownloaded(): Boolean {
         val app = application ?: return false
         val reTerminal = app.filesDir
@@ -135,199 +148,24 @@ object SetupManager {
             reTerminal.child("alpine.tar.gz").exists()
     }
 
-    /**
-     * Returns true if step 2 (libstdc++ + libgcc installed inside chroot) is done.
-     */
+    /** Returns true if step 3 (libstdc++ + libgcc installed inside chroot) is done. */
     fun areCppLibsInstalled(): Boolean = OpencodeManager.areCppLibsInstalled()
 
-    /**
-     * Returns true if step 3 (opencode binary installed) is done.
-     */
-    fun isOpencodeInstalled(): Boolean = OpencodeManager.isInstalled()
-
-    /**
-     * Returns true if every step is already complete (no setup needed).
-     */
+    /** Returns true if every step is already complete (no setup needed). */
     fun isSetupComplete(): Boolean {
-        return isAlpineDownloaded() && areCppLibsInstalled() && isOpencodeInstalled()
+        return isOpencodeInstalled() && isAlpineDownloaded() && areCppLibsInstalled()
     }
 
     // -------------------------------------------------------------------------
-    // STEP 1 — Download Alpine rootfs + proot + libtalloc
-    // -------------------------------------------------------------------------
-
-    /**
-     * Runs step 1: downloads proot, libtalloc.so.2, and alpine.tar.gz into the
-     * app's filesDir, if not already present. Streams progress to [progress]
-     * and [logLines].
-     */
-    suspend fun runStep1DownloadAlpine(): Boolean = withContext(Dispatchers.IO) {
-        currentStep.value = Step.DOWNLOAD_ALPINE
-        progress.value = 0f
-        log("=== Etapa 1: Baixando Alpine rootfs + proot + libtalloc ===")
-
-        try {
-            val abi = Build.SUPPORTED_ABIS.firstOrNull { it in abiMap }
-                ?: throw RuntimeException("CPU não suportada: ${Build.SUPPORTED_ABIS.joinToString()}")
-            log("ABI detectada: $abi")
-
-            val urls = abiMap[abi]!!
-            val app = application!!
-            val filesToDownload = listOf(
-                "libtalloc.so.2" to urls.talloc,
-                "proot" to urls.proot,
-                "alpine.tar.gz" to urls.alpine,
-            )
-
-            val totalFiles = filesToDownload.size
-            var completedFiles = 0
-
-            for ((name, url) in filesToDownload) {
-                val dest = app.filesDir.child(name)
-                if (dest.exists()) {
-                    log("  ✓ $name já existe, pulando download")
-                    completedFiles++
-                    progress.value = completedFiles.toFloat() / totalFiles
-                    continue
-                }
-                log("  ↓ Baixando $name...")
-                val ok = downloadFileWithProgress(url, dest) { downloaded, total ->
-                    val fileProgress = if (total > 0) downloaded.toFloat() / total else 0f
-                    progress.value = (completedFiles + fileProgress) / totalFiles
-                }
-                if (!ok) {
-                    throw IOException("Falha ao baixar $name")
-                }
-                if (name == "proot") {
-                    dest.setExecutable(true, true)
-                }
-                completedFiles++
-                progress.value = completedFiles.toFloat() / totalFiles
-                log("  ✓ $name baixado (${dest.length() / 1024} KB)")
-            }
-
-            progress.value = 1f
-            log("=== Etapa 1 concluída ===")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Step 1 failed", e)
-            log("!!! Etapa 1 falhou: ${e.message}")
-            lastError.value = "Etapa 1: ${e.message}"
-            currentStep.value = Step.FAILED
-            false
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // STEP 2 — Extract Alpine + install libstdc++/libgcc inside the chroot
-    // -------------------------------------------------------------------------
-
-    /**
-     * Runs step 2: extracts the Alpine rootfs (if not already extracted) and
-     * installs libstdc++ + libgcc via `apk add` inside the chroot, streaming
-     * apk's output to [logLines].
-     */
-    suspend fun runStep2InstallCppLibs(): Boolean = withContext(Dispatchers.IO) {
-        currentStep.value = Step.INSTALL_CPPLIBS
-        progress.value = 0f
-        log("=== Etapa 2: Instalando libstdc++ e libgcc dentro do Alpine ===")
-
-        try {
-            val app = application!!
-            val prefix = app.filesDir.parentFile!!.absolutePath
-            val alpineDir = alpineDir()
-
-            // 1) Make sure the Alpine rootfs is extracted (mirrors init-host.sh).
-            if (!alpineDir.child("bin").exists()) {
-                log("  Extraindo alpine.tar.gz...")
-                val alpineTar = app.filesDir.child("alpine.tar.gz")
-                if (!alpineTar.exists()) {
-                    throw IOException("alpine.tar.gz não encontrado. Rode a etapa 1 primeiro.")
-                }
-                alpineDir.mkdirs()
-                // Use proot's tar (busybox tar) — but we can also extract directly
-                // here since we're outside the chroot. Use Java's tar via commons-compress.
-                extractTarGz(alpineTar, alpineDir) { p ->
-                    progress.value = p * 0.5f
-                }
-                log("  ✓ Alpine extraído em ${alpineDir.absolutePath}")
-            } else {
-                log("  Alpine já está extraído")
-            }
-
-            // 2) Install libstdc++ and libgcc if not already present.
-            if (OpencodeManager.areCppLibsInstalled()) {
-                log("  libstdc++ e libgcc já estão instalados")
-                progress.value = 1f
-                log("=== Etapa 2 concluída ===")
-                return@withContext true
-            }
-
-            log("  Configurando resolv.conf...")
-            val resolvConf = alpineDir.child("etc").child("resolv.conf").apply { parentFile?.mkdirs() }
-            if (!resolvConf.exists() || resolvConf.length() == 0L) {
-                resolvConf.writeText("nameserver 8.8.8.8\nnameserver 8.8.4.4\n")
-            }
-
-            // 3) Materialize the proot binary into localBinDir (proot is run from
-            //    the Android side, not inside the chroot).
-            val prootBinary = localBinDir().child("proot")
-            if (!prootBinary.exists()) {
-                app.filesDir.child("proot").copyTo(prootBinary, overwrite = true)
-                prootBinary.setExecutable(true, true)
-            }
-
-            // 4) Materialize libtalloc.so.2 into localLibDir.
-            val libtalloc = localLibDir().child("libtalloc.so.2")
-            if (!libtalloc.exists()) {
-                app.filesDir.child("libtalloc.so.2").copyTo(libtalloc, overwrite = true)
-            }
-
-            // 5) Run `apk update` and `apk add libstdc++ libgcc` inside the chroot
-            //    via proot. Stream apk's stdout to our log buffer.
-            log("  Executando: apk update")
-            val apkUpdateOk = runProotApk(prefix, listOf("update"))
-            if (!apkUpdateOk) {
-                log("  (apk update falhou — tentando mesmo assim)")
-            }
-            progress.value = 0.6f
-
-            log("  Executando: apk add --no-cache libstdc++ libgcc")
-            val apkAddOk = runProotApk(prefix, listOf("add", "--no-cache", "libstdc++", "libgcc"))
-            if (!apkAddOk) {
-                throw IOException("apk add libstdc++ libgcc falhou. Verifique sua conexão de internet.")
-            }
-            progress.value = 1f
-
-            if (!OpencodeManager.areCppLibsInstalled()) {
-                throw IOException("libstdc++.so.6 não encontrado após apk add")
-            }
-            log("  ✓ libstdc++ e libgcc instalados com sucesso")
-            log("=== Etapa 2 concluída ===")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Step 2 failed", e)
-            log("!!! Etapa 2 falhou: ${e.message}")
-            lastError.value = "Etapa 2: ${e.message}"
-            currentStep.value = Step.FAILED
-            false
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // STEP 3 — Install opencode (download from GitHub release or import)
+    // STEP 1 — Install opencode (download from GitHub release or import via SAF)
     // -------------------------------------------------------------------------
 
     /**
      * Fetches the list of recent releases from github.com/anomalyco/opencode/releases.
-     * Returns a list of (tagName, publishedAt, assetDownloadUrl, assetSize).
-     *
-     * Only includes releases that ship an `opencode-linux-arm64-musl.tar.gz` asset
-     * AND are compatible with the device ABI (arm64-v8a → arm64 musl tarball).
+     * Returns only releases that ship an asset compatible with the device ABI.
      */
     suspend fun fetchReleases(): List<OpencodeRelease> = withContext(Dispatchers.IO) {
         val client = OkHttpClient()
-        // Fetch the latest 30 releases — enough for the user to pick from.
         val req = Request.Builder()
             .url("https://api.github.com/repos/anomalyco/opencode/releases?per_page=30")
             .header("Accept", "application/vnd.github+json")
@@ -349,7 +187,6 @@ object SetupManager {
                 for (j in 0 until assets.length()) {
                     val asset = assets.optJSONObject(j) ?: continue
                     val assetName = asset.optString("name")
-                    // Only include the asset that matches the device ABI.
                     val expectedAsset = expectedAssetNameForAbi() ?: continue
                     if (assetName == expectedAsset) {
                         val url = asset.optString("browser_download_url")
@@ -373,10 +210,6 @@ object SetupManager {
 
     /** Returns the expected opencode tarball asset name for the current device ABI. */
     fun expectedAssetNameForAbi(): String? {
-        // The opencode release uses these asset names:
-        //   - opencode-linux-arm64-musl.tar.gz       (for arm64-v8a devices)
-        //   - opencode-linux-x64-musl.tar.gz         (for x86_64 devices)
-        // ARMv7 doesn't have a compatible release.
         val abi = Build.SUPPORTED_ABIS.firstOrNull()
         return when (abi) {
             "arm64-v8a" -> "opencode-linux-arm64-musl.tar.gz"
@@ -386,85 +219,290 @@ object SetupManager {
     }
 
     /**
-     * Downloads the opencode tarball from [release.assetUrl] and installs the
-     * binary into the Alpine chroot.
+     * Step 1 (download variant): downloads the opencode tarball from
+     * [release.assetUrl], extracts the `opencode` binary, installs it into the
+     * Alpine chroot, and VERIFIES the result.
+     *
+     * Progress is streamed to [progress] and [logLines].
      */
-    suspend fun runStep3DownloadOpencode(release: OpencodeRelease): Boolean = withContext(Dispatchers.IO) {
+    suspend fun runStep1DownloadOpencode(release: OpencodeRelease): Boolean = withContext(Dispatchers.IO) {
         currentStep.value = Step.INSTALL_OPENCODE
         progress.value = 0f
-        log("=== Etapa 3: Baixando ${release.tagName} (${release.assetName}) ===")
+        statusMessage.value = "Baixando ${release.tagName}"
+        log("=== Etapa 1: Baixando ${release.tagName} (${release.assetName}) ===")
 
         try {
             val app = application!!
             val tmpTar = File(app.cacheDir, "opencode-${release.tagName}.tar.gz")
 
-            log("  ↓ Baixando ${release.assetName} (${release.assetSizeBytes / 1024 / 1024} MB)...")
-            val ok = downloadFileWithProgress(release.assetUrl, tmpTar) { downloaded, total ->
-                progress.value = if (total > 0) downloaded.toFloat() / total else 0f
+            // Phase 1a: download (0% → 60%)
+            log("  ↓ Baixando ${release.assetName} (${release.assetSizePretty})...")
+            val downloadOk = downloadFileWithProgress(release.assetUrl, tmpTar) { downloaded, total ->
+                val p = if (total > 0) downloaded.toFloat() / total else 0f
+                progress.value = p * 0.6f
             }
-            if (!ok) {
+            if (!downloadOk) {
                 throw IOException("Falha no download")
             }
             log("  ✓ Download concluído (${tmpTar.length() / 1024 / 1024} MB)")
+            progress.value = 0.6f
 
-            log("  Extraindo binário opencode...")
-            progress.value = 0f
+            // Phase 1b: extract (60% → 90%)
+            log("  Extraindo binário opencode do tar.gz...")
             val extracted = extractOpencodeFromTarGz(tmpTar) { p ->
-                progress.value = p
+                progress.value = 0.6f + p * 0.3f
             }
             if (extracted == null) {
-                throw IOException("Binário 'opencode' não encontrado dentro do tar.gz")
+                throw IOException("Binário 'opencode' não encontrado dentro do tar.gz. " +
+                    "Verifique se o arquivo é o opencode-linux-arm64-musl.tar.gz correto.")
             }
+            log("  ✓ Extração concluída (${extracted.length() / 1024 / 1024} MB)")
+            progress.value = 0.9f
 
+            // Phase 1c: install + verify (90% → 100%)
             log("  Instalando binário em ${OpencodeManager.binaryFile.absolutePath}...")
-            OpencodeManager.binaryFile.parentFile?.mkdirs()
-            if (OpencodeManager.binaryFile.exists()) OpencodeManager.binaryFile.delete()
-            if (!extracted.renameTo(OpencodeManager.binaryFile)) {
-                extracted.copyTo(OpencodeManager.binaryFile, overwrite = true)
-                extracted.delete()
-            }
-            OpencodeManager.binaryFile.setExecutable(true, true)
+            installExtractedBinary(extracted)
             runCatching { tmpTar.delete() }
+
+            // CRITICAL: verify the binary actually exists, is executable, and is
+            // big enough. The opencode binary is ~160 MB; anything smaller means
+            // extraction was incomplete or the wrong file was picked.
+            if (!verifyBinaryInstalled()) {
+                throw IOException(
+                    "Verificação pós-instalação falhou: o binário não existe, " +
+                        "não é executável, ou é menor que ${MIN_BINARY_SIZE_BYTES / 1024 / 1024} MB " +
+                        "(tamanho atual: ${OpencodeManager.binaryFile.length() / 1024 / 1024} MB). " +
+                        "A extração pode ter sido interrompida."
+                )
+            }
+            log("  ✓ Binário verificado: ${OpencodeManager.binaryFile.length() / 1024 / 1024} MB, executável")
             progress.value = 1f
-            log("  ✓ opencode instalado")
-            log("=== Etapa 3 concluída ===")
+            log("=== Etapa 1 concluída ===")
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Step 3 (download) failed", e)
-            log("!!! Etapa 3 falhou: ${e.message}")
-            lastError.value = "Etapa 3: ${e.message}"
+            Log.e(TAG, "Step 1 (download) failed", e)
+            log("!!! Etapa 1 falhou: ${e.message}")
+            lastError.value = "Etapa 1: ${e.message}"
             currentStep.value = Step.FAILED
             false
         }
     }
 
     /**
-     * Step 3 alternate: installs opencode from a user-selected tar.gz Uri (SAF).
-     * Reuses OpencodeManager.installFromUri() but also streams log output.
+     * Step 1 (import variant): installs opencode from a user-selected tar.gz Uri.
+     *
+     * This version properly streams progress to [progress] and [logLines] —
+     * unlike the old version which jumped from 0% to 100% with no intermediate
+     * feedback, making the user think extraction had finished while it was
+     * still running.
      */
-    suspend fun runStep3ImportOpencode(context: Context, uri: Uri): Boolean = withContext(Dispatchers.IO) {
+    suspend fun runStep1ImportOpencode(context: Context, uri: Uri): Boolean = withContext(Dispatchers.IO) {
         currentStep.value = Step.INSTALL_OPENCODE
         progress.value = 0f
-        log("=== Etapa 3: Importando tar.gz selecionado pelo usuário ===")
+        statusMessage.value = "Importando tar.gz..."
+        log("=== Etapa 1: Importando tar.gz selecionado pelo usuário ===")
 
         try {
-            // Wrap the install so we can stream progress to our log buffer.
-            // OpencodeManager.installFromUri already exposes progress via its
-            // own mutableStateOf fields — observe those here.
-            val ok = OpencodeManager.installFromUri(context, uri)
-            OpencodeManager.installStatus.value.takeIf { it.isNotBlank() }?.let { log("  $it") }
-            if (OpencodeManager.installError.value != null) {
-                log("  erro: ${OpencodeManager.installError.value}")
+            val app = application!!
+
+            // Phase 1a: copy SAF uri → temp file (0% → 40%)
+            log("  Lendo arquivo selecionado...")
+            val tmpTar = File(app.cacheDir, "opencode-import-${System.currentTimeMillis()}.tar.gz")
+            copyUriToFileWithProgress(context, uri, tmpTar) { written, total ->
+                val p = if (total > 0) written.toFloat() / total else 0f
+                progress.value = p * 0.4f
             }
-            if (!ok) {
-                throw IOException(OpencodeManager.installError.value ?: "Falha desconhecida")
+            log("  ✓ Arquivo copiado (${tmpTar.length() / 1024 / 1024} MB)")
+            progress.value = 0.4f
+
+            // Phase 1b: extract (40% → 80%)
+            log("  Extraindo binário opencode do tar.gz...")
+            val extracted = extractOpencodeFromTarGz(tmpTar) { p ->
+                progress.value = 0.4f + p * 0.4f
+            }
+            if (extracted == null) {
+                throw IOException("Binário 'opencode' não encontrado dentro do tar.gz. " +
+                    "Verifique se o arquivo é o opencode-linux-arm64-musl.tar.gz correto.")
+            }
+            log("  ✓ Extração concluída (${extracted.length() / 1024 / 1024} MB)")
+            progress.value = 0.8f
+
+            // Phase 1c: install + verify (80% → 100%)
+            log("  Instalando binário em ${OpencodeManager.binaryFile.absolutePath}...")
+            installExtractedBinary(extracted)
+            runCatching { tmpTar.delete() }
+
+            if (!verifyBinaryInstalled()) {
+                throw IOException(
+                    "Verificação pós-instalação falhou: o binário não existe, " +
+                        "não é executável, ou é menor que ${MIN_BINARY_SIZE_BYTES / 1024 / 1024} MB " +
+                        "(tamanho atual: ${OpencodeManager.binaryFile.length() / 1024 / 1024} MB). " +
+                        "A extração pode ter sido interrompida."
+                )
+            }
+            log("  ✓ Binário verificado: ${OpencodeManager.binaryFile.length() / 1024 / 1024} MB, executável")
+            progress.value = 1f
+            log("=== Etapa 1 concluída ===")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Step 1 (import) failed", e)
+            log("!!! Etapa 1 falhou: ${e.message}")
+            lastError.value = "Etapa 1: ${e.message}"
+            currentStep.value = Step.FAILED
+            false
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // STEP 2 — Download Alpine rootfs + proot + libtalloc
+    // -------------------------------------------------------------------------
+
+    /**
+     * Runs step 2: downloads proot, libtalloc.so.2, and alpine.tar.gz into the
+     * app's filesDir, if not already present.
+     */
+    suspend fun runStep2DownloadAlpine(): Boolean = withContext(Dispatchers.IO) {
+        currentStep.value = Step.DOWNLOAD_ALPINE
+        progress.value = 0f
+        statusMessage.value = "Baixando Alpine + proot"
+        log("=== Etapa 2: Baixando Alpine rootfs + proot + libtalloc ===")
+
+        try {
+            val abi = Build.SUPPORTED_ABIS.firstOrNull { it in abiMap }
+                ?: throw RuntimeException("CPU não suportada: ${Build.SUPPORTED_ABIS.joinToString()}")
+            log("  ABI detectada: $abi")
+
+            val urls = abiMap[abi]!!
+            val app = application!!
+            val filesToDownload = listOf(
+                "libtalloc.so.2" to urls.talloc,
+                "proot" to urls.proot,
+                "alpine.tar.gz" to urls.alpine,
+            )
+
+            val totalFiles = filesToDownload.size
+            var completedFiles = 0
+
+            for ((name, url) in filesToDownload) {
+                val dest = app.filesDir.child(name)
+                if (dest.exists() && dest.length() > 0) {
+                    log("  ✓ $name já existe, pulando download")
+                    completedFiles++
+                    progress.value = completedFiles.toFloat() / totalFiles
+                    continue
+                }
+                log("  ↓ Baixando $name...")
+                val ok = downloadFileWithProgress(url, dest) { downloaded, total ->
+                    val fileProgress = if (total > 0) downloaded.toFloat() / total else 0f
+                    progress.value = (completedFiles + fileProgress) / totalFiles
+                }
+                if (!ok) {
+                    throw IOException("Falha ao baixar $name")
+                }
+                if (name == "proot") {
+                    dest.setExecutable(true, true)
+                }
+                completedFiles++
+                progress.value = completedFiles.toFloat() / totalFiles
+                log("  ✓ $name baixado (${dest.length() / 1024} KB)")
+            }
+
+            progress.value = 1f
+            log("=== Etapa 2 concluída ===")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Step 2 failed", e)
+            log("!!! Etapa 2 falhou: ${e.message}")
+            lastError.value = "Etapa 2: ${e.message}"
+            currentStep.value = Step.FAILED
+            false
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // STEP 3 — Extract Alpine + install libstdc++/libgcc inside the chroot
+    // -------------------------------------------------------------------------
+
+    /**
+     * Runs step 3: extracts the Alpine rootfs (if not already extracted) and
+     * installs libstdc++ + libgcc via `apk add` inside the chroot.
+     */
+    suspend fun runStep3InstallCppLibs(): Boolean = withContext(Dispatchers.IO) {
+        currentStep.value = Step.INSTALL_CPPLIBS
+        progress.value = 0f
+        statusMessage.value = "Instalando libstdc++ no chroot"
+        log("=== Etapa 3: Instalando libstdc++ e libgcc dentro do Alpine ===")
+
+        try {
+            val app = application!!
+            val prefix = app.filesDir.parentFile!!.absolutePath
+            val alpineDir = alpineDir()
+
+            // 1) Extract Alpine rootfs if not already done.
+            if (!alpineDir.child("bin").exists()) {
+                log("  Extraindo alpine.tar.gz...")
+                val alpineTar = app.filesDir.child("alpine.tar.gz")
+                if (!alpineTar.exists()) {
+                    throw IOException("alpine.tar.gz não encontrado. Rode a etapa 2 primeiro.")
+                }
+                alpineDir.mkdirs()
+                extractTarGz(alpineTar, alpineDir) { p ->
+                    progress.value = p * 0.5f
+                }
+                log("  ✓ Alpine extraído em ${alpineDir.absolutePath}")
+            } else {
+                log("  Alpine já está extraído")
+            }
+
+            // 2) Skip if libs already installed.
+            if (OpencodeManager.areCppLibsInstalled()) {
+                log("  libstdc++ e libgcc já estão instalados")
+                progress.value = 1f
+                log("=== Etapa 3 concluída ===")
+                return@withContext true
+            }
+
+            // 3) Set up resolv.conf for apk.
+            log("  Configurando resolv.conf...")
+            val resolvConf = alpineDir.child("etc").child("resolv.conf").apply { parentFile?.mkdirs() }
+            if (!resolvConf.exists() || resolvConf.length() == 0L) {
+                resolvConf.writeText("nameserver 8.8.8.8\nnameserver 8.8.4.4\n")
+            }
+
+            // 4) Materialize proot + libtalloc into localBin/localLib.
+            val prootBinary = localBinDir().child("proot")
+            if (!prootBinary.exists()) {
+                app.filesDir.child("proot").copyTo(prootBinary, overwrite = true)
+                prootBinary.setExecutable(true, true)
+            }
+            val libtalloc = localLibDir().child("libtalloc.so.2")
+            if (!libtalloc.exists()) {
+                app.filesDir.child("libtalloc.so.2").copyTo(libtalloc, overwrite = true)
+            }
+
+            // 5) Run apk update + apk add.
+            log("  Executando: apk update")
+            val apkUpdateOk = runProotApk(prefix, listOf("update"))
+            if (!apkUpdateOk) {
+                log("  (apk update falhou — tentando mesmo assim)")
+            }
+            progress.value = 0.6f
+
+            log("  Executando: apk add --no-cache libstdc++ libgcc")
+            val apkAddOk = runProotApk(prefix, listOf("add", "--no-cache", "libstdc++", "libgcc"))
+            if (!apkAddOk) {
+                throw IOException("apk add libstdc++ libgcc falhou. Verifique sua conexão de internet.")
             }
             progress.value = 1f
-            log("  ✓ opencode instalado via import")
+
+            if (!OpencodeManager.areCppLibsInstalled()) {
+                throw IOException("libstdc++.so.6 não encontrado após apk add")
+            }
+            log("  ✓ libstdc++ e libgcc instalados com sucesso")
             log("=== Etapa 3 concluída ===")
             true
         } catch (e: Exception) {
-            Log.e(TAG, "Step 3 (import) failed", e)
+            Log.e(TAG, "Step 3 failed", e)
             log("!!! Etapa 3 falhou: ${e.message}")
             lastError.value = "Etapa 3: ${e.message}"
             currentStep.value = Step.FAILED
@@ -487,7 +525,9 @@ object SetupManager {
         lastError.value = null
     }
 
-    // ---- internals ----
+    // -------------------------------------------------------------------------
+    // Internals: download / extract / install helpers
+    // -------------------------------------------------------------------------
 
     /** Downloads [url] to [dest], reporting progress to [onProgress]. */
     private suspend fun downloadFileWithProgress(
@@ -522,6 +562,39 @@ object SetupManager {
         }
     }
 
+    /** Copies a SAF Uri to [dest], reporting progress to [onProgress]. */
+    private fun copyUriToFileWithProgress(
+        context: Context,
+        uri: Uri,
+        dest: File,
+        onProgress: (Long, Long) -> Unit,
+    ) {
+        val resolver = context.contentResolver
+        val input = resolver.openInputStream(uri)
+            ?: throw IOException("Não foi possível abrir o arquivo selecionado.")
+
+        var total = -1L
+        runCatching {
+            resolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+                total = afd.length
+            }
+        }
+
+        input.use { ins ->
+            BufferedOutputStream(FileOutputStream(dest)).use { out ->
+                val buf = ByteArray(64 * 1024)
+                var written = 0L
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    written += n
+                    onProgress(written, total)
+                }
+            }
+        }
+    }
+
     /** Extracts a .tar.gz into [destDir], reporting progress via [onProgress]. */
     private fun extractTarGz(tarGz: File, destDir: File, onProgress: (Float) -> Unit) {
         val total = tarGz.length().coerceAtLeast(1)
@@ -544,7 +617,6 @@ object SetupManager {
                                     onProgress(consumed.toFloat() / total)
                                 }
                             }
-                            // Preserve mode (executable bit) where possible.
                             if ((entry.mode and 0b001_000_000) != 0) {
                                 outFile.setExecutable(true, true)
                             }
@@ -556,7 +628,14 @@ object SetupManager {
         }
     }
 
-    /** Streams through the .tar.gz looking for the `opencode` entry. */
+    /**
+     * Streams through the .tar.gz looking for the `opencode` entry.
+     * Returns the extracted temp file, or null if not found.
+     *
+     * IMPORTANT: this function blocks until the entry is FULLY extracted.
+     * The caller MUST NOT assume the extraction is complete until this
+     * function returns a non-null File.
+     */
     private fun extractOpencodeFromTarGz(tarGz: File, onProgress: (Float) -> Unit): File? {
         val out = File(tarGz.parentFile, "opencode-extracted-${System.currentTimeMillis()}")
         var found = false
@@ -569,6 +648,8 @@ object SetupManager {
                     while (entry != null) {
                         val name = entry.name.trim('/')
                         if (!found && (name == "opencode" || File(name).name == "opencode") && !entry.isDirectory) {
+                            // Found the opencode entry — copy it to `out`.
+                            // This loop blocks until the ENTIRE entry is read.
                             BufferedOutputStream(FileOutputStream(out)).use { bos ->
                                 val buf = ByteArray(64 * 1024)
                                 while (true) {
@@ -579,9 +660,11 @@ object SetupManager {
                                     onProgress(consumed.toFloat() / totalSize)
                                 }
                             }
+                            // Flush is implicit via BufferedOutputStream.close().
                             found = true
                             break
                         }
+                        // Skip this entry.
                         val skipped = tis.available()
                         if (skipped > 0) {
                             val buf = ByteArray(64 * 1024)
@@ -598,8 +681,54 @@ object SetupManager {
     }
 
     /**
+     * Moves the extracted binary to its final location and chmod +x.
+     * Blocks until the file is fully in place.
+     */
+    private fun installExtractedBinary(extracted: File) {
+        OpencodeManager.binaryFile.parentFile?.mkdirs()
+        if (OpencodeManager.binaryFile.exists()) {
+            OpencodeManager.binaryFile.delete()
+        }
+        // renameTo can fail across filesystems; fall back to copy.
+        // copyTo blocks until the file is fully written.
+        if (!extracted.renameTo(OpencodeManager.binaryFile)) {
+            extracted.copyTo(OpencodeManager.binaryFile, overwrite = true)
+            extracted.delete()
+        }
+        if (!OpencodeManager.binaryFile.setExecutable(true, true)) {
+            throw IOException("Não foi possível tornar o binário executável.")
+        }
+    }
+
+    /**
+     * CRITICAL verification: confirms the binary actually exists, is executable,
+     * AND is big enough to be a real opencode binary (≥ 50 MB).
+     *
+     * This catches the bug where the UI reported "extraction complete" while
+     * extraction was still running, or where the user picked a wrong/small file.
+     */
+    private fun verifyBinaryInstalled(): Boolean {
+        val f = OpencodeManager.binaryFile
+        if (!f.exists()) {
+            Log.e(TAG, "verifyBinaryInstalled: file does not exist at ${f.absolutePath}")
+            return false
+        }
+        if (!f.canExecute()) {
+            Log.e(TAG, "verifyBinaryInstalled: file not executable")
+            return false
+        }
+        val size = f.length()
+        if (size < MIN_BINARY_SIZE_BYTES) {
+            Log.e(TAG, "verifyBinaryInstalled: file too small ($size bytes, expected ≥ $MIN_BINARY_SIZE_BYTES)")
+            return false
+        }
+        Log.i(TAG, "verifyBinaryInstalled: OK ($size bytes)")
+        return true
+    }
+
+    /**
      * Runs `apk <args>` inside the Alpine chroot via proot, streaming apk's
-     * stdout/stderr to our log buffer. Returns true on success (exit code 0).
+     * stdout/stderr to our log buffer.
      */
     private fun runProotApk(prefix: String, apkArgs: List<String>): Boolean {
         val app = application!!
@@ -607,7 +736,6 @@ object SetupManager {
         val proot = localBinDir().child("proot")
         val alpineDir = alpineDir()
 
-        // Build proot args (minimal — just enough for apk).
         val args = mutableListOf(
             "--kill-on-exit",
             "-w", "/",
@@ -621,13 +749,11 @@ object SetupManager {
             "-b", "/sys",
             "-b", prefix,
         )
-        // System binds.
         listOf("/apex", "/odm", "/product", "/system", "/system_ext", "/vendor").forEach { mnt ->
             if (File(mnt).exists()) args.addAll(listOf("-b", mnt))
         }
         if (File("/proc/self/fd").exists()) args.addAll(listOf("-b", "/proc/self/fd:/dev/fd"))
 
-        // Build the full command: linker proot <args> /sbin/apk <apkArgs>
         val cmd = mutableListOf(linker, proot.absolutePath)
         cmd.addAll(args)
         cmd.add("/sbin/apk")
@@ -672,7 +798,6 @@ data class OpencodeRelease(
     val assetUrl: String,
     val assetSizeBytes: Long,
 ) {
-    /** Pretty-printed size, e.g. "53 MB". */
     val assetSizePretty: String
         get() {
             val mb = assetSizeBytes / 1024.0 / 1024.0

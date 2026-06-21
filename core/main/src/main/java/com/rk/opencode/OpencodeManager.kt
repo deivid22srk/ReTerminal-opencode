@@ -81,9 +81,15 @@ object OpencodeManager {
     /** Human-readable status message for the UI during install. */
     val installStatus = mutableStateOf<String>("")
 
-    /** True when the opencode binary is present and executable. */
+    /** Minimum acceptable size for the opencode binary (50 MB).
+     *  The real binary is ~160 MB; anything smaller means extraction was
+     *  incomplete or the wrong file was picked. */
+    private const val MIN_BINARY_SIZE_BYTES = 50L * 1024 * 1024
+
+    /** True when the opencode binary is present, executable, AND big enough
+     *  to be a real opencode binary (not a truncated/partial extraction). */
     fun isInstalled(): Boolean {
-        return binaryFile.exists() && binaryFile.canExecute()
+        return binaryFile.exists() && binaryFile.canExecute() && binaryFile.length() >= MIN_BINARY_SIZE_BYTES
     }
 
     /**
